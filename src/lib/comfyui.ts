@@ -272,6 +272,39 @@ export function openProgressSocket(
   return () => ws.close()
 }
 
+// Returns Map<sourceNodeId, clipNodeIds[]> by reading the raw UI workflow link graph.
+// Used by the edit-prompts modal to group CLIPTextEncode nodes that share a source
+// text node — even when loadWorkflow() has already inlined the values.
+export async function getRawClipGroups(filename: string): Promise<Map<string, string[]>> {
+  try {
+    const res = await fetch(`${base()}/cpe/workflow/get?filename=${encodeURIComponent(filename)}`)
+    if (!res.ok) return new Map()
+    const raw = await res.json()
+    const uw = typeof raw.workflow === 'string' ? JSON.parse(raw.workflow as string) : raw.workflow
+    if (!uw) return new Map()
+
+    const linkById = new Map<number, [number, number, number, number, number, string]>()
+    for (const l of uw.links ?? []) linkById.set(l[0], l)
+
+    const groups = new Map<string, string[]>()
+    for (const node of uw.nodes ?? []) {
+      if (node.type !== 'CLIPTextEncode') continue
+      const textInput = (node.inputs ?? []).find((inp: { name: string }) => inp.name === 'text')
+      if (!textInput || textInput.link == null) continue
+      const link = linkById.get(textInput.link)
+      if (!link) continue
+      const srcId = String(link[1])
+      const dstId = String(node.id)
+      const arr = groups.get(srcId) ?? []
+      arr.push(dstId)
+      groups.set(srcId, arr)
+    }
+    return groups
+  } catch {
+    return new Map()
+  }
+}
+
 export function randomClientId(): string {
   // crypto.randomUUID() requires a secure context (HTTPS/localhost);
   // fall back to Math.random for plain-HTTP LAN access from mobile.

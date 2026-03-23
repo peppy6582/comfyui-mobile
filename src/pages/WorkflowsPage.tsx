@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   listWorkflows,
   loadWorkflow,
+  getRawClipGroups,
   queuePrompt,
   getHistory,
   getQueueStatus,
@@ -29,10 +30,33 @@ interface RunStatus {
 }
 
 interface EditField {
-  nodeId: string
+  nodeId: string           // CLIPTextEncode nodeId, or source node ID for grouped fields
   title: string
   original: string
   current: string
+  groupedClipNodeIds?: string[]  // set when multiple CLIPTextEncodes share a source text node
+}
+
+// Extracts the text string from a node that outputs text (Text, String, etc.)
+function getNodeText(node: Record<string, unknown>): string {
+  const inputs = (node as { inputs?: Record<string, unknown> }).inputs
+  if (!inputs) return ''
+  for (const key of ['text', 'string', 'value', 'content', 'prompt']) {
+    if (typeof inputs[key] === 'string') return inputs[key] as string
+  }
+  const firstStr = Object.values(inputs).find((v) => typeof v === 'string')
+  return typeof firstStr === 'string' ? firstStr : ''
+}
+
+// Derive a display title for a group of CLIPTextEncode nodes sharing a source.
+function groupTitle(titles: string[]): string {
+  if (titles.length === 0) return 'Prompt'
+  if (titles.length === 1) return titles[0]
+  const lower = titles.map((t) => t.toLowerCase())
+  if (lower.every((t) => t.includes('positive') || t.includes(' pos'))) return 'Positive Prompt'
+  if (lower.every((t) => t.includes('negative') || t.includes(' neg'))) return 'Negative Prompt'
+  if (new Set(titles).size === 1) return titles[0]
+  return titles[0]
 }
 
 const clientId = randomClientId()
@@ -95,20 +119,95 @@ export default function WorkflowsPage() {
     setEditError('')
     setEditFields([])
     try {
-      const workflow = await loadWorkflow(wf.filename)
+      const [workflow, clipGroups] = await Promise.all([
+        loadWorkflow(wf.filename),
+        getRawClipGroups(wf.filename),
+      ])
       const overrides = getTextOverrides(wf.filename)
-      const fields: EditField[] = Object.entries(workflow)
-        .filter(([, node]) => (node as { class_type?: string }).class_type === 'CLIPTextEncode')
-        .map(([nodeId, node]) => {
-          const n = node as { inputs?: { text?: string }; _meta?: { title?: string } }
-          const original = n.inputs?.text ?? ''
-          return {
-            nodeId,
-            title: n._meta?.title ?? `Node ${nodeId}`,
-            original,
-            current: overrides[nodeId] ?? original,
+
+      // Scan all node inputs to find which CLIPTextEncode IDs are used as
+      // "positive" or "negative" inputs to sampler nodes. This gives proper labels.
+      const positiveIds = new Set<string>()
+      const negativeIds = new Set<string>()
+      for (const [, node] of Object.entries(workflow)) {
+        const n = node as { inputs?: Record<string, unknown> }
+        if (!n.inputs) continue
+        for (const [key, val] of Object.entries(n.inputs)) {
+          if (Array.isArray(val) && val.length >= 2) {
+            const refId = String(val[0])
+            if (key === 'positive') positiveIds.add(refId)
+            if (key === 'negative') negativeIds.add(refId)
           }
+        }
+      }
+
+      // Derive a role-based title for a set of clip node IDs.
+      function roleTitle(nodeIds: string[]): string | null {
+        const hasPos = nodeIds.some((id) => positiveIds.has(id))
+        const hasNeg = nodeIds.some((id) => negativeIds.has(id))
+        if (hasPos && !hasNeg) return 'Positive Prompt'
+        if (hasNeg && !hasPos) return 'Negative Prompt'
+        return null
+      }
+
+      // Build set of clip node IDs already assigned to a shared-source group.
+      const groupedClipIds = new Set<string>()
+      for (const clips of clipGroups.values()) {
+        if (clips.length > 1) clips.forEach((id) => groupedClipIds.add(id))
+      }
+
+      const fields: EditField[] = []
+
+      // One field per multi-clip source group (CLIP-G + CLIP-L sharing one text node).
+      for (const [, clipIds] of clipGroups) {
+        if (clipIds.length < 2) continue
+        const firstNode = workflow[clipIds[0]] as { inputs?: { text?: unknown }; _meta?: { title?: string } } | undefined
+        const textVal = firstNode?.inputs?.text
+        const original = typeof textVal === 'string'
+          ? textVal
+          : Array.isArray(textVal) && textVal.length >= 2
+            ? (() => { const src = workflow[String(textVal[0])]; return src ? getNodeText(src as Record<string, unknown>) : '' })()
+            : ''
+        const clipTitles = clipIds.map((id) => {
+          const n = workflow[id] as { _meta?: { title?: string } } | undefined
+          return n?._meta?.title ?? `Node ${id}`
         })
+        const title = roleTitle(clipIds) ?? groupTitle(clipTitles)
+        const savedOverride = clipIds.map((id) => overrides[id]).find((v) => v !== undefined)
+        fields.push({ nodeId: clipIds[0], title, original, current: savedOverride ?? original, groupedClipNodeIds: clipIds })
+      }
+
+      // Group remaining CLIPTextEncode nodes by identical text content.
+      // In SDXL workflows, BASE and REFINER each have their own CLIPTextEncode for
+      // the same positive/negative prompt — same text, different CLIP source.
+      // We collapse those into one edit field so the user edits the prompt once.
+      const textToNodeIds = new Map<string, string[]>()
+      for (const [nodeId, node] of Object.entries(workflow)) {
+        const n = node as { class_type?: string; inputs?: { text?: unknown } }
+        if (n.class_type !== 'CLIPTextEncode') continue
+        if (groupedClipIds.has(nodeId)) continue
+        const text = typeof n.inputs?.text === 'string' ? n.inputs.text : ''
+        const arr = textToNodeIds.get(text) ?? []
+        arr.push(nodeId)
+        textToNodeIds.set(text, arr)
+      }
+
+      for (const [text, nodeIds] of textToNodeIds) {
+        const firstNode = workflow[nodeIds[0]] as { _meta?: { title?: string } } | undefined
+        const savedOverride = nodeIds.map((id) => overrides[id]).find((v) => v !== undefined)
+        const title = roleTitle(nodeIds)
+          ?? (nodeIds.length > 1
+            ? groupTitle(nodeIds.map((id) => (workflow[id] as { _meta?: { title?: string } } | undefined)?._meta?.title ?? `Node ${id}`))
+            : (firstNode?._meta?.title ?? `Node ${nodeIds[0]}`))
+        fields.push({
+          nodeId: nodeIds[0],
+          title,
+          original: text,
+          current: savedOverride ?? text,
+          ...(nodeIds.length > 1 ? { groupedClipNodeIds: nodeIds } : {}),
+        })
+      }
+
       setEditFields(fields)
     } catch (e: unknown) {
       setEditError(e instanceof Error ? e.message : 'Failed to load workflow')
@@ -121,7 +220,16 @@ export default function WorkflowsPage() {
     if (!editTarget) return
     const overrides: Record<string, string> = {}
     for (const f of editFields) {
-      if (f.current !== f.original) overrides[f.nodeId] = f.current
+      if (f.current === f.original) continue
+      if (f.groupedClipNodeIds) {
+        // Store override keyed by each CLIPTextEncode node ID so handleRun() can
+        // inline the text directly, replacing the array ref at queue time
+        for (const clipId of f.groupedClipNodeIds) {
+          overrides[clipId] = f.current
+        }
+      } else {
+        overrides[f.nodeId] = f.current
+      }
     }
     saveTextOverrides(editTarget.filename, overrides)
     setOverridesVersion((v) => v + 1)
