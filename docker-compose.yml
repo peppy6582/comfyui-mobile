@@ -1,0 +1,8 @@
+services:
+  comfyui-mobile:
+    build: .
+    image: comfyui-mobile:latest
+    container_name: comfyui-mobile
+    ports:
+      - "8080:80"
+    restart: unless-stopped
