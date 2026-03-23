@@ -148,6 +148,16 @@ export async function loadWorkflow(filename: string): Promise<Record<string, unk
   return workflow
 }
 
+// Re-randomize seeds on an already-loaded workflow (call before each queue submission).
+export function randomizeSeeds(workflow: Record<string, unknown>): void {
+  for (const nodeData of Object.values(workflow)) {
+    const inputs = (nodeData as { inputs?: Record<string, unknown> }).inputs
+    if (!inputs) continue
+    if ('seed' in inputs) inputs.seed = Math.floor(Math.random() * 0xffffffff)
+    if ('noise_seed' in inputs) inputs.noise_seed = Math.floor(Math.random() * 0xffffffff)
+  }
+}
+
 type UiNode = { id: number; type?: string; inputs?: { name: string; link?: number | null }[]; widgets_values?: unknown[] }
 type UiLink = [number, number, number, number, number, string] // [id, srcNode, srcSlot, dstNode, dstSlot, type]
 

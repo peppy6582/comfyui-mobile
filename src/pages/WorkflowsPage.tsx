@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   listWorkflows,
   loadWorkflow,
@@ -14,7 +14,7 @@ import {
   type ProgressEvent,
   type BrowserStatus,
 } from '../lib/comfyui'
-import { getPinned, addPinned, removePinned, type PinnedWorkflow } from '../lib/workflows'
+import { getPinned, addPinned, removePinned, getTextOverrides, saveTextOverrides, type PinnedWorkflow } from '../lib/workflows'
 
 type RunState = 'idle' | 'queued' | 'running' | 'done' | 'error'
 
@@ -26,6 +26,13 @@ interface RunStatus {
   queuePosition: number
   outputs: OutputImage[]
   error: string
+}
+
+interface EditField {
+  nodeId: string
+  title: string
+  original: string
+  current: string
 }
 
 const clientId = randomClientId()
@@ -43,6 +50,19 @@ export default function WorkflowsPage() {
   const warmupPoll = useRef<ReturnType<typeof setInterval> | null>(null)
   const runGuard = useRef(false)
   const closeSocket = useRef<(() => void) | null>(null)
+
+  // Edit modal state
+  const [showEdit, setShowEdit] = useState(false)
+  const [editTarget, setEditTarget] = useState<PinnedWorkflow | null>(null)
+  const [editLoading, setEditLoading] = useState(false)
+  const [editError, setEditError] = useState('')
+  const [editFields, setEditFields] = useState<EditField[]>([])
+  const [overridesVersion, setOverridesVersion] = useState(0)
+  // derived: which pinned filenames currently have saved text overrides
+  const hasOverrides = useMemo(
+    () => new Set(pinned.map((p) => p.filename).filter((f) => Object.keys(getTextOverrides(f)).length > 0)),
+    [pinned, overridesVersion]
+  )
 
   function openBrowse() {
     setShowBrowse(true)
@@ -68,6 +88,56 @@ export default function WorkflowsPage() {
     }
   }
 
+  async function openEditModal(wf: PinnedWorkflow) {
+    setEditTarget(wf)
+    setShowEdit(true)
+    setEditLoading(true)
+    setEditError('')
+    setEditFields([])
+    try {
+      const workflow = await loadWorkflow(wf.filename)
+      const overrides = getTextOverrides(wf.filename)
+      const fields: EditField[] = Object.entries(workflow)
+        .filter(([, node]) => (node as { class_type?: string }).class_type === 'CLIPTextEncode')
+        .map(([nodeId, node]) => {
+          const n = node as { inputs?: { text?: string }; _meta?: { title?: string } }
+          const original = n.inputs?.text ?? ''
+          return {
+            nodeId,
+            title: n._meta?.title ?? `Node ${nodeId}`,
+            original,
+            current: overrides[nodeId] ?? original,
+          }
+        })
+      setEditFields(fields)
+    } catch (e: unknown) {
+      setEditError(e instanceof Error ? e.message : 'Failed to load workflow')
+    } finally {
+      setEditLoading(false)
+    }
+  }
+
+  function handleSaveEdit() {
+    if (!editTarget) return
+    const overrides: Record<string, string> = {}
+    for (const f of editFields) {
+      if (f.current !== f.original) overrides[f.nodeId] = f.current
+    }
+    saveTextOverrides(editTarget.filename, overrides)
+    setOverridesVersion((v) => v + 1)
+    setShowEdit(false)
+  }
+
+  function handleRevertField(nodeId: string) {
+    setEditFields((fields) =>
+      fields.map((f) => f.nodeId === nodeId ? { ...f, current: f.original } : f)
+    )
+  }
+
+  function handleRevertAll() {
+    setEditFields((fields) => fields.map((f) => ({ ...f, current: f.original })))
+  }
+
   async function handleRun() {
     if (!selected || runGuard.current) return
     runGuard.current = true
@@ -89,6 +159,11 @@ export default function WorkflowsPage() {
 
     try {
       const workflow = await loadWorkflow(selected.filename)
+      const overrides = getTextOverrides(selected.filename)
+      for (const [nodeId, text] of Object.entries(overrides)) {
+        const node = workflow[nodeId] as { inputs?: Record<string, unknown> }
+        if (node?.inputs) node.inputs.text = text
+      }
       closeSocket.current?.()
       closeSocket.current = openProgressSocket(clientId, (e: ProgressEvent) => {
         if (e.type === 'progress') {
@@ -197,6 +272,19 @@ export default function WorkflowsPage() {
                       : '▶  Run'}
                   </button>
                   <button
+                    onClick={() => openEditModal(wf)}
+                    className={`relative rounded-lg px-4 py-2.5 text-sm font-medium ${
+                      hasOverrides.has(wf.filename)
+                        ? 'bg-violet-900/40 text-violet-300 active:bg-violet-900/60'
+                        : 'bg-white/10 text-gray-300 active:bg-white/20'
+                    }`}
+                  >
+                    {hasOverrides.has(wf.filename) && (
+                      <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-violet-400" />
+                    )}
+                    Edit
+                  </button>
+                  <button
                     onClick={() => handleRemovePin(wf.filename)}
                     className="rounded-lg bg-red-900/30 px-4 py-2.5 text-sm font-medium text-red-400 active:bg-red-900/50"
                   >
@@ -247,6 +335,93 @@ export default function WorkflowsPage() {
           </div>
         ))}
       </div>
+
+      {/* Edit prompts sheet */}
+      {showEdit && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-[#0f0f0f]">
+          <div className="sticky top-0 border-b border-white/10 bg-[#0f0f0f]/90 px-4 py-3 backdrop-blur flex items-center justify-between">
+            <div>
+              <h2 className="text-lg font-semibold">Edit Prompts</h2>
+              <p className="text-xs text-gray-500 truncate max-w-[220px]">{editTarget?.name}</p>
+            </div>
+            <button
+              onClick={() => setShowEdit(false)}
+              className="rounded-full bg-white/10 w-8 h-8 flex items-center justify-center text-gray-400 active:bg-white/20"
+            >
+              ✕
+            </button>
+          </div>
+
+          {editLoading && (
+            <div className="flex h-40 items-center justify-center text-gray-400 text-sm">Loading…</div>
+          )}
+
+          {editError && (
+            <div className="m-4 rounded-xl border border-red-800 bg-red-900/20 p-4 text-sm text-red-300">
+              <p className="font-semibold">Could not load workflow</p>
+              <p className="mt-1 text-xs opacity-75">{editError}</p>
+            </div>
+          )}
+
+          {!editLoading && !editError && editFields.length === 0 && (
+            <div className="flex h-40 items-center justify-center text-gray-400 text-sm">
+              No text prompt nodes found in this workflow.
+            </div>
+          )}
+
+          {!editLoading && !editError && editFields.length > 0 && (
+            <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-5">
+              {editFields.map((field) => (
+                <div key={field.nodeId}>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-sm font-medium text-gray-300">
+                      {field.title}
+                      {field.current !== field.original && (
+                        <span className="ml-2 text-xs text-violet-400">edited</span>
+                      )}
+                    </label>
+                    {field.current !== field.original && (
+                      <button
+                        onClick={() => handleRevertField(field.nodeId)}
+                        className="text-xs text-gray-500 active:text-gray-300"
+                      >
+                        Revert
+                      </button>
+                    )}
+                  </div>
+                  <textarea
+                    value={field.current}
+                    onChange={(e) =>
+                      setEditFields((fields) =>
+                        fields.map((f) => f.nodeId === field.nodeId ? { ...f, current: e.target.value } : f)
+                      )
+                    }
+                    rows={4}
+                    className="w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2.5 text-sm text-white resize-none focus:outline-none focus:border-violet-500"
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {!editLoading && !editError && editFields.length > 0 && (
+            <div className="sticky bottom-0 border-t border-white/10 bg-[#0f0f0f]/90 px-4 py-3 backdrop-blur flex gap-2">
+              <button
+                onClick={handleRevertAll}
+                className="rounded-lg bg-white/10 px-4 py-2.5 text-sm font-medium text-gray-300 active:bg-white/20"
+              >
+                Revert All
+              </button>
+              <button
+                onClick={handleSaveEdit}
+                className="flex-1 rounded-lg bg-violet-600 py-2.5 text-sm font-semibold active:bg-violet-700"
+              >
+                Save
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Browse sheet — full-screen overlay */}
       {showBrowse && (

@@ -25,6 +25,34 @@ export function removePinned(filename: string): void {
   localStorage.setItem(PINNED_KEY, JSON.stringify(getPinned().filter((p) => p.filename !== filename)))
 }
 
+// --- Text overrides (per-workflow CLIPTextEncode node overrides) ---
+
+const TEXT_OVERRIDES_KEY = 'comfyui_text_overrides'
+
+function getAllTextOverrides(): Record<string, Record<string, string>> {
+  try { return JSON.parse(localStorage.getItem(TEXT_OVERRIDES_KEY) ?? '{}') } catch { return {} }
+}
+
+export function getTextOverrides(filename: string): Record<string, string> {
+  return getAllTextOverrides()[filename] ?? {}
+}
+
+export function saveTextOverrides(filename: string, overrides: Record<string, string>): void {
+  const all = getAllTextOverrides()
+  if (Object.keys(overrides).length === 0) {
+    delete all[filename]
+  } else {
+    all[filename] = overrides
+  }
+  localStorage.setItem(TEXT_OVERRIDES_KEY, JSON.stringify(all))
+}
+
+export function clearAllTextOverrides(filename: string): void {
+  const all = getAllTextOverrides()
+  delete all[filename]
+  localStorage.setItem(TEXT_OVERRIDES_KEY, JSON.stringify(all))
+}
+
 export interface SavedWorkflow {
   id: string
   name: string
